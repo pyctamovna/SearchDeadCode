@@ -1,0 +1,33 @@
+//! SearchDeadCode - Fast dead code detection for Android (Kotlin/Java)
+//!
+//! This library provides static analysis capabilities to detect unused code
+//! in Android projects written in Kotlin and Java.
+//!
+//! # Architecture
+//!
+//! The analysis pipeline consists of:
+//! 1. **File Discovery** - Find all .kt, .java, and .xml files
+//! 2. **Parsing** - Parse source files using tree-sitter
+//! 3. **Graph Building** - Build a reference graph of declarations
+//! 4. **Entry Point Detection** - Identify Android entry points
+//! 5. **Reachability Analysis** - Find unreachable code
+//! 6. **Reporting** - Output results in various formats
+
+pub mod config;
+pub mod coverage;
+pub mod discovery;
+pub mod parser;
+pub mod graph;
+pub mod analysis;
+pub mod refactor;
+pub mod report;
+pub mod proguard;
+
+pub use config::Config;
+pub use coverage::{CoverageData, CoverageParser, parse_coverage_file, parse_coverage_files};
+pub use discovery::FileFinder;
+pub use graph::{Graph, Declaration, DeclarationKind, Reference};
+pub use analysis::{EntryPointDetector, ReachabilityAnalyzer, HybridAnalyzer, DeadCode, Confidence};
+pub use report::{Reporter, ReportFormat};
+pub use refactor::SafeDeleter;
+pub use proguard::{ProguardUsage, UsageEntryKind};

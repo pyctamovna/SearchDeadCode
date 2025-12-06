@@ -1,0 +1,929 @@
+use clap::Parser;
+use colored::Colorize;
+use miette::Result;
+use std::path::PathBuf;
+use tracing::info;
+
+mod baseline;
+mod cache;
+mod config;
+mod coverage;
+mod discovery;
+mod parser;
+mod graph;
+mod analysis;
+mod refactor;
+mod report;
+mod proguard;
+mod watch;
+
+use proguard::{ProguardUsage, ReportGenerator};
+
+use config::Config;
+use coverage::parse_coverage_files;
+use discovery::FileFinder;
+use graph::{GraphBuilder, ParallelGraphBuilder};
+use analysis::{Confidence, CycleDetector, DeepAnalyzer, EnhancedAnalyzer, EntryPointDetector, HybridAnalyzer, ReachabilityAnalyzer, ResourceDetector};
+use analysis::detectors::{Detector, UnusedParamDetector, WriteOnlyDetector, UnusedSealedVariantDetector, RedundantOverrideDetector, UnusedIntentExtraDetector};
+use report::Reporter;
+
+/// SearchDeadCode - Fast dead code detection for Android (Kotlin/Java)
+#[derive(Parser, Debug)]
+#[command(name = "searchdeadcode")]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to the project directory to analyze
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Path to configuration file
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Target directories to analyze (can be specified multiple times)
+    #[arg(short, long)]
+    target: Vec<PathBuf>,
+
+    /// Patterns to exclude (can be specified multiple times)
+    #[arg(short, long)]
+    exclude: Vec<String>,
+
+    /// Patterns to retain - never report as dead (can be specified multiple times)
+    #[arg(short, long)]
+    retain: Vec<String>,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value = "terminal")]
+    format: OutputFormat,
+
+    /// Output file (for json/sarif formats)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Enable safe delete mode
+    #[arg(long)]
+    delete: bool,
+
+    /// Interactive mode for deletions (confirm each)
+    #[arg(long)]
+    interactive: bool,
+
+    /// Dry run - show what would be deleted without making changes
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Generate undo script
+    #[arg(long)]
+    undo_script: Option<PathBuf>,
+
+    /// Detection types to run (comma-separated)
+    #[arg(long)]
+    detect: Option<String>,
+
+    /// Coverage files (JaCoCo XML, Kover XML, or LCOV format)
+    /// Can be specified multiple times for merged coverage
+    #[arg(long, value_name = "FILE")]
+    coverage: Vec<PathBuf>,
+
+    /// Minimum confidence level to report (low, medium, high, confirmed)
+    #[arg(long, default_value = "low")]
+    min_confidence: String,
+
+    /// Only show findings confirmed by runtime coverage
+    #[arg(long)]
+    runtime_only: bool,
+
+    /// Include runtime-dead code (reachable but never executed)
+    #[arg(long)]
+    include_runtime_dead: bool,
+
+    /// Detect and report zombie code cycles (mutually dependent dead code)
+    #[arg(long)]
+    detect_cycles: bool,
+
+    /// ProGuard/R8 usage.txt file for enhanced detection
+    /// This file lists code that R8 determined is unused
+    #[arg(long, value_name = "FILE")]
+    proguard_usage: Option<PathBuf>,
+
+    /// Generate a filtered dead code report from ProGuard usage.txt
+    /// Filters out generated code (Dagger, Hilt, _Factory, _Impl, etc.)
+    #[arg(long, value_name = "FILE")]
+    generate_report: Option<PathBuf>,
+
+    /// Package prefix to include in report (e.g., "com.example")
+    /// Only classes matching this prefix will be included
+    #[arg(long, value_name = "PREFIX")]
+    report_package: Option<String>,
+
+    /// Enable parallel processing for faster analysis
+    #[arg(long)]
+    parallel: bool,
+
+    /// Enable enhanced detection mode with ProGuard cross-validation
+    #[arg(long)]
+    enhanced: bool,
+
+    /// Enable deep analysis mode - more aggressive detection
+    /// Does not auto-mark class members as reachable
+    /// Detects unused members even in reachable classes
+    #[arg(long)]
+    deep: bool,
+
+    /// Enable unused parameter detection
+    /// Finds function parameters that are declared but never used
+    #[arg(long)]
+    unused_params: bool,
+
+    /// Enable unused resource detection
+    /// Finds Android resources (strings, colors, etc.) that are never referenced
+    #[arg(long)]
+    unused_resources: bool,
+
+    /// Enable write-only variable detection
+    /// Finds variables that are assigned but never read (Phase 9)
+    #[arg(long)]
+    write_only: bool,
+
+    /// Enable unused sealed variant detection
+    /// Finds sealed class variants that are never instantiated (Phase 10)
+    #[arg(long)]
+    sealed_variants: bool,
+
+    /// Enable redundant override detection
+    /// Finds method overrides that only call super (Phase 10)
+    #[arg(long)]
+    redundant_overrides: bool,
+
+    /// Enable unused Intent extra detection
+    /// Finds putExtra() keys that are never retrieved via getXxxExtra() (Phase 11)
+    #[arg(long)]
+    unused_extras: bool,
+
+    /// Enable incremental analysis with caching
+    /// Skips re-parsing unchanged files for faster subsequent runs
+    #[arg(long)]
+    incremental: bool,
+
+    /// Clear the analysis cache before running
+    #[arg(long)]
+    clear_cache: bool,
+
+    /// Custom cache file path (default: .searchdeadcode-cache.json)
+    #[arg(long, value_name = "FILE")]
+    cache_path: Option<PathBuf>,
+
+    /// Baseline file for ignoring existing issues
+    /// New issues not in baseline will be reported
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+
+    /// Generate a baseline file from current results
+    #[arg(long, value_name = "FILE")]
+    generate_baseline: Option<PathBuf>,
+
+    /// Watch mode - continuously monitor for changes
+    #[arg(long)]
+    watch: bool,
+
+    /// Verbose output
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Quiet mode - only output results
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+enum OutputFormat {
+    #[default]
+    Terminal,
+    Json,
+    Sarif,
+}
+
+impl From<OutputFormat> for report::ReportFormat {
+    fn from(format: OutputFormat) -> Self {
+        match format {
+            OutputFormat::Terminal => report::ReportFormat::Terminal,
+            OutputFormat::Json => report::ReportFormat::Json,
+            OutputFormat::Sarif => report::ReportFormat::Sarif,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Initialize logging
+    init_logging(cli.verbose, cli.quiet);
+
+    info!("SearchDeadCode v{}", env!("CARGO_PKG_VERSION"));
+
+    // Load configuration
+    let config = load_config(&cli)?;
+
+    // Watch mode
+    if cli.watch {
+        run_watch_mode(&config, &cli)?;
+    } else {
+        // Run analysis once
+        run_analysis(&config, &cli)?;
+    }
+
+    Ok(())
+}
+
+fn run_watch_mode(config: &Config, cli: &Cli) -> Result<()> {
+    use watch::FileWatcher;
+
+    let watcher = FileWatcher::new();
+
+    // Clone what we need for the closure
+    let config = config.clone();
+    let cli_path = cli.path.clone();
+    let cli_format = cli.format.clone();
+    let cli_output = cli.output.clone();
+    let cli_verbose = cli.verbose;
+    let cli_quiet = cli.quiet;
+    let cli_deep = cli.deep;
+    let cli_parallel = cli.parallel;
+    let cli_enhanced = cli.enhanced;
+    let cli_detect_cycles = cli.detect_cycles;
+    let cli_min_confidence = cli.min_confidence.clone();
+    let cli_baseline = cli.baseline.clone();
+    let cli_coverage = cli.coverage.clone();
+    let cli_proguard_usage = cli.proguard_usage.clone();
+
+    watcher.watch(&cli.path, move || {
+        // Suppress output for repeated runs except results
+        if !cli_verbose {
+            // Temporarily change log level
+        }
+
+        // Re-run analysis
+        match run_analysis_internal(
+            &config,
+            &cli_path,
+            cli_format.clone(),
+            cli_output.clone(),
+            cli_deep,
+            cli_parallel,
+            cli_enhanced,
+            cli_detect_cycles,
+            &cli_min_confidence,
+            &cli_baseline,
+            &cli_coverage,
+            &cli_proguard_usage,
+            cli_quiet,
+        ) {
+            Ok(_) => {
+                println!();
+                println!("{}", "✓ Analysis complete. Waiting for changes...".green());
+                true
+            }
+            Err(e) => {
+                eprintln!("{}: {}", "Analysis error".red(), e);
+                true // Continue watching
+            }
+        }
+    }).map_err(|e| miette::miette!("Watch error: {}", e))?;
+
+    Ok(())
+}
+
+/// Internal analysis function for watch mode
+fn run_analysis_internal(
+    config: &Config,
+    path: &PathBuf,
+    format: OutputFormat,
+    output: Option<PathBuf>,
+    deep: bool,
+    parallel: bool,
+    enhanced: bool,
+    detect_cycles: bool,
+    min_confidence: &str,
+    baseline_path: &Option<PathBuf>,
+    coverage_files: &[PathBuf],
+    proguard_usage: &Option<PathBuf>,
+    quiet: bool,
+) -> Result<()> {
+    use colored::Colorize;
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+
+    // Discover files
+    let finder = FileFinder::new(config);
+    let files = finder.find_files(path)?;
+
+    if files.is_empty() {
+        if !quiet {
+            println!("{}", "No Kotlin or Java files found.".yellow());
+        }
+        return Ok(());
+    }
+
+    // Parse and build graph
+    let graph = if parallel {
+        let parallel_builder = ParallelGraphBuilder::new();
+        parallel_builder.build_from_files(&files)?
+    } else {
+        let mut graph_builder = GraphBuilder::new();
+        for file in &files {
+            graph_builder.process_file(file)?;
+        }
+        graph_builder.build()
+    };
+
+    // Detect entry points
+    let entry_detector = EntryPointDetector::new(config);
+    let entry_points = entry_detector.detect(&graph, path)?;
+
+    // Load ProGuard data if available
+    let proguard_data = if let Some(ref usage_path) = proguard_usage {
+        ProguardUsage::parse(usage_path).ok()
+    } else {
+        None
+    };
+
+    // Run reachability analysis
+    let (dead_code, reachable) = if deep {
+        let analyzer = DeepAnalyzer::new()
+            .with_parallel(parallel)
+            .with_unused_members(true);
+        analyzer.analyze(&graph, &entry_points)
+    } else if enhanced && proguard_data.is_some() {
+        let mut analyzer = EnhancedAnalyzer::new();
+        if let Some(pg) = proguard_data.clone() {
+            analyzer = analyzer.with_proguard(pg);
+        }
+        analyzer.analyze(&graph, &entry_points)
+    } else {
+        let analyzer = ReachabilityAnalyzer::new();
+        analyzer.find_unreachable_with_reachable(&graph, &entry_points)
+    };
+
+    // Load coverage data
+    let coverage_data = if !coverage_files.is_empty() {
+        parse_coverage_files(coverage_files).ok()
+    } else {
+        None
+    };
+
+    // Enhance findings
+    let mut hybrid = HybridAnalyzer::new();
+    if let Some(coverage) = coverage_data {
+        hybrid = hybrid.with_coverage(coverage);
+    }
+    if let Some(proguard) = proguard_data {
+        hybrid = hybrid.with_proguard(proguard);
+    }
+
+    let dead_code = hybrid.enhance_findings(dead_code);
+
+    // Filter by confidence
+    let min_conf = parse_confidence(min_confidence);
+    let dead_code: Vec<_> = dead_code
+        .into_iter()
+        .filter(|dc| dc.confidence >= min_conf)
+        .collect();
+
+    // Apply baseline filter
+    let dead_code = if let Some(ref bp) = baseline_path {
+        match baseline::Baseline::load(bp) {
+            Ok(baseline) => {
+                let stats = baseline.stats(&dead_code, path);
+                if !quiet {
+                    println!("{}", format!("📋 Baseline: {}", stats).cyan());
+                }
+                baseline.filter_new(&dead_code, path)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            }
+            Err(_) => dead_code,
+        }
+    } else {
+        dead_code
+    };
+
+    // Detect cycles if requested
+    if detect_cycles {
+        let cycle_detector = CycleDetector::new();
+        let cycle_stats = cycle_detector.get_cycle_stats(&graph, &reachable);
+        if cycle_stats.has_cycles() && !quiet {
+            println!(
+                "{}",
+                format!(
+                    "🧟 {} dead cycles ({} declarations)",
+                    cycle_stats.num_dead_cycles,
+                    cycle_stats.total_declarations_in_cycles
+                ).yellow()
+            );
+        }
+    }
+
+    // Report results
+    let reporter = Reporter::new(format.into(), output);
+    reporter.report(&dead_code)?;
+
+    // Print timing
+    let elapsed = start_time.elapsed();
+    if !quiet {
+        println!(
+            "{}",
+            format!("⏱  Analyzed {} files in {:.2}s", files.len(), elapsed.as_secs_f64()).dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+fn init_logging(verbose: bool, quiet: bool) {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = if quiet {
+        EnvFilter::new("error")
+    } else if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::new("info")
+    };
+
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
+fn load_config(cli: &Cli) -> Result<Config> {
+    let mut config = if let Some(config_path) = &cli.config {
+        Config::from_file(config_path)?
+    } else {
+        // Try to load from default locations
+        Config::from_default_locations(&cli.path)?
+    };
+
+    // Override with CLI arguments
+    if !cli.target.is_empty() {
+        config.targets = cli.target.clone();
+    }
+    if !cli.exclude.is_empty() {
+        config.exclude.extend(cli.exclude.clone());
+    }
+    if !cli.retain.is_empty() {
+        config.retain_patterns.extend(cli.retain.clone());
+    }
+
+    Ok(config)
+}
+
+fn run_analysis(config: &Config, cli: &Cli) -> Result<()> {
+    use colored::Colorize;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+
+    // Step 1: Discover files
+    info!("Discovering files...");
+    let finder = FileFinder::new(config);
+    let files = finder.find_files(&cli.path)?;
+
+    info!("Found {} files to analyze", files.len());
+
+    if files.is_empty() {
+        println!("{}", "No Kotlin or Java files found.".yellow());
+        return Ok(());
+    }
+
+    // Step 2: Parse files and build graph
+    let graph = if cli.parallel {
+        // Parallel parsing mode
+        println!(
+            "{}",
+            format!("⚡ Parallel mode: parsing {} files...", files.len()).cyan()
+        );
+        let parallel_builder = ParallelGraphBuilder::new();
+        parallel_builder.build_from_files(&files)?
+    } else {
+        // Sequential parsing mode
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        info!("Parsing files...");
+        let mut graph_builder = GraphBuilder::new();
+
+        for file in &files {
+            graph_builder.process_file(file)?;
+            pb.inc(1);
+        }
+        pb.finish_with_message("Parsing complete");
+
+        graph_builder.build()
+    };
+
+    let parse_time = start_time.elapsed();
+    if cli.parallel {
+        println!(
+            "{}",
+            format!("⚡ Parsed {} files in {:.2}s", files.len(), parse_time.as_secs_f64()).green()
+        );
+    }
+
+    // Step 3: Detect entry points
+    info!("Detecting entry points...");
+    let entry_detector = EntryPointDetector::new(config);
+    let entry_points = entry_detector.detect(&graph, &cli.path)?;
+
+    info!("Found {} entry points", entry_points.len());
+
+    // Step 4: Load ProGuard data early if available (needed for enhanced mode)
+    let proguard_data = if let Some(ref usage_path) = cli.proguard_usage {
+        info!("Loading ProGuard usage.txt from {:?}...", usage_path);
+        match ProguardUsage::parse(usage_path) {
+            Ok(data) => {
+                let stats = data.stats();
+                info!("ProGuard usage: {}", stats);
+                println!(
+                    "{}",
+                    format!(
+                        "📋 ProGuard usage.txt: {} unused items ({} classes, {} methods)",
+                        stats.total, stats.classes, stats.methods
+                    ).cyan()
+                );
+                Some(data)
+            }
+            Err(e) => {
+                eprintln!("{}: Failed to load usage.txt: {}", "Warning".yellow(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Step 5: Run reachability analysis (deep, enhanced, or standard)
+    info!("Running reachability analysis...");
+
+    let (dead_code, reachable) = if cli.deep {
+        // Deep analysis mode - most aggressive
+        println!("{}", "🔬 Deep mode: aggressive dead code detection...".cyan());
+        let deep = DeepAnalyzer::new()
+            .with_parallel(cli.parallel)
+            .with_unused_members(true);
+        deep.analyze(&graph, &entry_points)
+    } else if cli.enhanced && proguard_data.is_some() {
+        // Enhanced mode with ProGuard cross-validation
+        println!("{}", "🔍 Enhanced mode: cross-validating with ProGuard data...".cyan());
+        let mut enhanced = EnhancedAnalyzer::new();
+        if let Some(pg) = proguard_data.clone() {
+            enhanced = enhanced.with_proguard(pg);
+        }
+        enhanced.analyze(&graph, &entry_points)
+    } else if cli.parallel {
+        // Standard analysis with parallel analyzer
+        let enhanced = EnhancedAnalyzer::new();
+        enhanced.analyze(&graph, &entry_points)
+    } else {
+        // Standard sequential analysis
+        let analyzer = ReachabilityAnalyzer::new();
+        analyzer.find_unreachable_with_reachable(&graph, &entry_points)
+    };
+
+    info!("Reachability: {} reachable, {} total", reachable.len(), graph.declarations().count());
+
+    // Step 6: Load coverage data if provided
+    let coverage_data = if !cli.coverage.is_empty() {
+        info!("Loading coverage data from {} file(s)...", cli.coverage.len());
+        match parse_coverage_files(&cli.coverage) {
+            Ok(data) => {
+                let stats = data.stats();
+                info!(
+                    "Coverage: {} files, {} classes ({:.1}% covered), {} methods ({:.1}% covered)",
+                    stats.total_files,
+                    stats.total_classes,
+                    stats.class_coverage_percent(),
+                    stats.total_methods,
+                    stats.method_coverage_percent()
+                );
+                Some(data)
+            }
+            Err(e) => {
+                eprintln!("{}: Failed to load coverage: {}", "Warning".yellow(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Step 7: Generate filtered report if requested
+    if let Some(ref report_path) = cli.generate_report {
+        if let Some(ref proguard) = proguard_data {
+            info!("Generating filtered dead code report...");
+            let generator = ReportGenerator::new()
+                .with_package_filter(cli.report_package.clone());
+
+            match generator.generate(proguard, report_path) {
+                Ok(stats) => {
+                    println!(
+                        "{}",
+                        format!(
+                            "📝 Report generated: {} ({} classes, {} filtered)",
+                            report_path.display(),
+                            stats.classes,
+                            stats.filtered_generated
+                        ).green()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("{}: Failed to generate report: {}", "Error".red(), e);
+                }
+            }
+        } else {
+            eprintln!(
+                "{}",
+                "Error: --generate-report requires --proguard-usage".red()
+            );
+        }
+    }
+
+    // Step 8: Enhance findings with hybrid analysis
+    let mut hybrid = HybridAnalyzer::new();
+    if let Some(coverage) = coverage_data {
+        hybrid = hybrid.with_coverage(coverage);
+    }
+    if let Some(proguard) = proguard_data.clone() {
+        hybrid = hybrid.with_proguard(proguard);
+    }
+
+    let mut dead_code = hybrid.enhance_findings(dead_code);
+
+    // Step 9: Find runtime-dead code (reachable but never executed)
+    if cli.include_runtime_dead {
+        let runtime_dead = hybrid.find_runtime_dead_code(&graph, &reachable);
+        if !runtime_dead.is_empty() {
+            info!("Found {} additional runtime-dead code items", runtime_dead.len());
+            dead_code.extend(runtime_dead);
+        }
+    }
+
+    // Step 9b: Detect unused parameters
+    if cli.unused_params {
+        let param_detector = UnusedParamDetector::new();
+        let unused_params = param_detector.detect(&graph);
+        if !unused_params.is_empty() {
+            info!("Found {} unused parameters", unused_params.len());
+            dead_code.extend(unused_params);
+        }
+    }
+
+    // Step 9c: Detect write-only variables (Phase 9)
+    if cli.write_only {
+        let write_only_detector = WriteOnlyDetector::new();
+        let write_only_vars = write_only_detector.detect(&graph);
+        if !write_only_vars.is_empty() {
+            info!("Found {} write-only variables", write_only_vars.len());
+            dead_code.extend(write_only_vars);
+        }
+    }
+
+    // Step 9d: Detect unused sealed variants (Phase 10)
+    if cli.sealed_variants {
+        let sealed_detector = UnusedSealedVariantDetector::new();
+        let sealed_issues = sealed_detector.detect(&graph);
+        if !sealed_issues.is_empty() {
+            info!("Found {} unused sealed variants", sealed_issues.len());
+            dead_code.extend(sealed_issues);
+        }
+    }
+
+    // Step 9e: Detect redundant overrides (Phase 10)
+    if cli.redundant_overrides {
+        let override_detector = RedundantOverrideDetector::new();
+        let override_issues = override_detector.detect(&graph);
+        if !override_issues.is_empty() {
+            info!("Found {} redundant overrides", override_issues.len());
+            dead_code.extend(override_issues);
+        }
+    }
+
+    // Step 9f: Detect unused Android resources
+    if cli.unused_resources {
+        let resource_detector = ResourceDetector::new();
+        let resource_analysis = resource_detector.analyze(&cli.path);
+        if !resource_analysis.unused.is_empty() {
+            info!(
+                "Found {} unused resources ({} total defined, {} referenced)",
+                resource_analysis.unused.len(),
+                resource_analysis.defined.values().map(|m| m.len()).sum::<usize>(),
+                resource_analysis.referenced.len()
+            );
+            // Print unused resources directly (they're not part of the code graph)
+            if !cli.quiet {
+                use colored::Colorize;
+                println!();
+                println!("{}", "📦 Unused Android Resources:".yellow().bold());
+                for resource in &resource_analysis.unused {
+                    let rel_path = resource.file
+                        .strip_prefix(&cli.path)
+                        .unwrap_or(&resource.file);
+                    println!(
+                        "  {} {}:{} - {} '{}'",
+                        "○".dimmed(),
+                        rel_path.display(),
+                        resource.line,
+                        resource.resource_type,
+                        resource.name
+                    );
+                }
+                println!();
+            }
+        }
+    }
+
+    // Step 9g: Detect unused Intent extras (Phase 11)
+    if cli.unused_extras {
+        let intent_detector = UnusedIntentExtraDetector::new();
+        let intent_analysis = intent_detector.analyze(&cli.path);
+        if !intent_analysis.unused_extras.is_empty() {
+            info!(
+                "Found {} unused Intent extras ({} total put, {} retrieved)",
+                intent_analysis.unused_extras.len(),
+                intent_analysis.total_put,
+                intent_analysis.total_get
+            );
+            // Print unused extras directly
+            if !cli.quiet {
+                use colored::Colorize;
+                println!();
+                println!("{}", "🔑 Unused Intent Extras:".yellow().bold());
+                for extra in &intent_analysis.unused_extras {
+                    let rel_path = extra.file
+                        .strip_prefix(&cli.path)
+                        .unwrap_or(&extra.file);
+                    println!(
+                        "  {} {}:{} - putExtra(\"{}\") never retrieved",
+                        "○".dimmed(),
+                        rel_path.display(),
+                        extra.line,
+                        extra.key
+                    );
+                }
+                println!();
+            }
+        }
+    }
+
+    // Step 10: Filter by confidence level
+    let min_confidence = parse_confidence(&cli.min_confidence);
+    let dead_code: Vec<_> = dead_code
+        .into_iter()
+        .filter(|dc| dc.confidence >= min_confidence)
+        .filter(|dc| !cli.runtime_only || dc.runtime_confirmed)
+        .collect();
+
+    info!("Found {} dead code candidates", dead_code.len());
+
+    // Step 11: Detect zombie code cycles if requested
+    if cli.detect_cycles {
+        let cycle_detector = CycleDetector::new();
+        let cycle_stats = cycle_detector.get_cycle_stats(&graph, &reachable);
+
+        if cycle_stats.has_cycles() {
+            println!();
+            println!(
+                "{}",
+                format!("🧟 Zombie Code Detected:").yellow().bold()
+            );
+            println!(
+                "  {} dead cycles found ({} declarations)",
+                cycle_stats.num_dead_cycles,
+                cycle_stats.total_declarations_in_cycles
+            );
+            if cycle_stats.largest_cycle_size > 2 {
+                println!(
+                    "  Largest cycle: {} mutually dependent declarations",
+                    cycle_stats.largest_cycle_size
+                );
+            }
+            if cycle_stats.num_zombie_pairs > 0 {
+                println!(
+                    "  {} zombie pairs (A↔B mutual references)",
+                    cycle_stats.num_zombie_pairs
+                );
+            }
+
+            // Print cycle details
+            let dead_cycles = cycle_detector.find_dead_cycles(&graph, &reachable);
+            for (i, cycle) in dead_cycles.iter().take(5).enumerate() {
+                println!();
+                println!(
+                    "  {}",
+                    format!("Cycle #{} ({} items):", i + 1, cycle.size).dimmed()
+                );
+                for name in cycle.names.iter().take(5) {
+                    println!("    • {}", name);
+                }
+                if cycle.names.len() > 5 {
+                    println!("    ... and {} more", cycle.names.len() - 5);
+                }
+            }
+            if dead_cycles.len() > 5 {
+                println!();
+                println!("  ... and {} more cycles", dead_cycles.len() - 5);
+            }
+            println!();
+        }
+    }
+
+    // Step 12: Generate baseline if requested
+    if let Some(ref baseline_path) = cli.generate_baseline {
+        info!("Generating baseline file...");
+        let baseline = baseline::Baseline::from_findings(&dead_code, &cli.path);
+        match baseline.save(baseline_path) {
+            Ok(_) => {
+                println!(
+                    "{}",
+                    format!(
+                        "📋 Baseline generated: {} ({} issues)",
+                        baseline_path.display(),
+                        dead_code.len()
+                    ).green()
+                );
+            }
+            Err(e) => {
+                eprintln!("{}: Failed to generate baseline: {}", "Error".red(), e);
+            }
+        }
+    }
+
+    // Step 13: Filter by baseline if provided
+    let dead_code = if let Some(ref baseline_path) = cli.baseline {
+        match baseline::Baseline::load(baseline_path) {
+            Ok(baseline) => {
+                let stats = baseline.stats(&dead_code, &cli.path);
+                println!(
+                    "{}",
+                    format!("📋 Baseline: {}", stats).cyan()
+                );
+
+                // Only report new issues not in baseline
+                let new_issues: Vec<_> = baseline.filter_new(&dead_code, &cli.path)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+
+                if new_issues.is_empty() && stats.baselined_found > 0 {
+                    println!("{}", "✓ No new dead code issues found!".green());
+                }
+
+                new_issues
+            }
+            Err(e) => {
+                eprintln!("{}: Failed to load baseline: {}", "Warning".yellow(), e);
+                dead_code
+            }
+        }
+    } else {
+        dead_code
+    };
+
+    // Step 14: Report results
+    let reporter = Reporter::new(cli.format.clone().into(), cli.output.clone());
+    reporter.report(&dead_code)?;
+
+    // Print timing
+    let elapsed = start_time.elapsed();
+    info!("Analysis completed in {:.2}s", elapsed.as_secs_f64());
+
+    // Step 15: Safe delete if requested
+    if cli.delete && !dead_code.is_empty() {
+        let deleter = refactor::SafeDeleter::new(
+            cli.interactive,
+            cli.dry_run,
+            cli.undo_script.clone(),
+        );
+        deleter.delete(&dead_code)?;
+    }
+
+    Ok(())
+}
+
+fn parse_confidence(s: &str) -> Confidence {
+    match s.to_lowercase().as_str() {
+        "low" => Confidence::Low,
+        "medium" => Confidence::Medium,
+        "high" => Confidence::High,
+        "confirmed" => Confidence::Confirmed,
+        _ => Confidence::Low,
+    }
+}

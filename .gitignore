@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Personal/temp files
+*.tmp
+*.bak
+dead_code_report*.txt
+sample_usage.txt
+
+# Cargo
+Cargo.toml.new
+Cargo.toml.tmp

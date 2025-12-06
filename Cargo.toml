@@ -1,0 +1,101 @@
+[package]
+name = "searchdeadcode"
+version = "0.4.0"
+edition = "2021"
+authors = ["Kevin"]
+description = "A fast CLI tool to detect and remove dead/unused code in Android projects (Kotlin & Java)"
+license = "MIT"
+repository = "https://github.com/KevinDoremy/SearchDeadCode"
+keywords = ["dead-code", "kotlin", "java", "android", "static-analysis"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Parsing
+tree-sitter = "0.22"
+tree-sitter-kotlin = "0.3.6"
+tree-sitter-java = "0.21"
+
+# Graph
+petgraph = "0.6"
+
+# File discovery
+ignore = "0.4"
+walkdir = "2.4"
+
+# Parallelism
+rayon = "1.8"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# XML parsing
+quick-xml = "0.31"
+
+# Regex for resource detection
+regex = "1.10"
+
+# Terminal UI
+colored = "2.1"
+indicatif = "0.17"
+console = "0.15"
+
+# Error handling
+miette = { version = "5.10", features = ["fancy"] }
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Interactive prompts
+dialoguer = "0.11"
+
+# File watching
+notify = "6.1"
+notify-debouncer-mini = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.9"
+assert_cmd = "2.0"
+predicates = "3.0"
+criterion = "0.5"
+
+[[bench]]
+name = "parsing_bench"
+harness = false
+
+[[test]]
+name = "analysis"
+path = "tests/integration/analysis_test.rs"
+
+[[test]]
+name = "detectors"
+path = "tests/integration/detector_tests.rs"
+
+[[test]]
+name = "cli"
+path = "tests/integration/cli_tests.rs"
+
+[[test]]
+name = "comprehensive"
+path = "tests/integration/comprehensive_tests.rs"
+
+[[test]]
+name = "false_positives"
+path = "tests/integration/false_positive_tests.rs"
+
+[[test]]
+name = "advanced"
+path = "tests/integration/advanced_tests.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
