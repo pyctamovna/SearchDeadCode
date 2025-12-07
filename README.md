@@ -1,5 +1,9 @@
 # SearchDeadCode
 
+[![CI](https://github.com/KevinDoremy/SearchDeadCode/actions/workflows/ci.yml/badge.svg)](https://github.com/KevinDoremy/SearchDeadCode/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+
 A blazingly fast CLI tool written in Rust to detect and safely remove dead/unused code in Android projects (Kotlin & Java).
 
 Inspired by [Periphery](https://github.com/peripheryapp/periphery) for Swift.
@@ -27,7 +31,7 @@ Inspired by [Periphery](https://github.com/peripheryapp/periphery) for Swift.
 
 ```bash
 # Build from source
-git clone https://github.com/user/searchdeadcode
+git clone https://github.com/KevinDoremy/SearchDeadCode
 cd searchdeadcode
 cargo build --release
 
@@ -42,7 +46,7 @@ cargo build --release
 
 ```bash
 # From source
-git clone https://github.com/user/searchdeadcode
+git clone https://github.com/KevinDoremy/SearchDeadCode
 cd searchdeadcode
 cargo install --path .
 
