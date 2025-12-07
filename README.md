@@ -45,14 +45,48 @@ cargo build --release
 
 ## Installation
 
-```bash
-# From source
-git clone https://github.com/KevinDoremy/SearchDeadCode
-cd searchdeadcode
-cargo install --path .
+### Via Cargo (Recommended)
 
-# Or via cargo (when published)
+```bash
 cargo install searchdeadcode
+```
+
+### Pre-built Binaries
+
+Download the latest release from [GitHub Releases](https://github.com/KevinDoremy/SearchDeadCode/releases).
+
+Available binaries:
+- `searchdeadcode-linux-x86_64` - Linux (Intel/AMD 64-bit)
+- `searchdeadcode-linux-aarch64` - Linux (ARM 64-bit)
+- `searchdeadcode-macos-x86_64` - macOS (Intel)
+- `searchdeadcode-macos-aarch64` - macOS (Apple Silicon)
+- `searchdeadcode-windows-x86_64.exe` - Windows (64-bit)
+
+#### macOS: Bypass Gatekeeper Warning
+
+macOS may show a security warning because the binary isn't code-signed. To run it:
+
+**Option 1: Remove quarantine attribute (recommended)**
+```bash
+xattr -d com.apple.quarantine ~/Downloads/searchdeadcode-macos-*
+chmod +x ~/Downloads/searchdeadcode-macos-*
+```
+
+**Option 2: Right-click → Open**
+- Right-click the binary in Finder
+- Select "Open" from the context menu
+- Click "Open" in the dialog
+
+**Option 3: System Preferences**
+- Go to System Preferences → Privacy & Security
+- Click "Open Anyway" next to the blocked app message
+
+### From Source
+
+```bash
+git clone https://github.com/KevinDoremy/SearchDeadCode
+cd SearchDeadCode
+cargo install --path .
 ```
 
 ## Usage
